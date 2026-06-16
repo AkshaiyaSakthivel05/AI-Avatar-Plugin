@@ -1,0 +1,6 @@
+{
+  "agent_id": "agent_5501kv8bhrymfzvamxtw2wzz29t3",
+  "agent_name": "Trading Assistant",
+  "agent_first_message": "Hello! How can I help you today?",
+  "max_context_chars": 6000
+}
