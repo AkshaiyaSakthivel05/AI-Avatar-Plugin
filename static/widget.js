@@ -14,7 +14,7 @@
  *   State           — single observable state atom + event bus
  *   Styles          — all CSS for the Shadow DOM
  *   DOMBuilder      — creates the Shadow DOM structure
- *   PhotoAvatar     — portrait photo + canvas speaking-effects overlay
+ *   PhotoAvatar     — portrait drawn on canvas with mouth-warp lip sync, blink, sway
  *   ThreeAvatar     — Three.js procedural face with jaw lip-sync
  *   LipSyncEngine   — drives whichever avatar is active
  *   PageScraper     — collects page context + registered sources
@@ -46,9 +46,13 @@
     AVATAR_URL:
       (_scriptEl && _scriptEl.getAttribute("data-avatar-url")) || null,
 
-    THREE_CDN:      "https://esm.sh/three@0.169.0",
-    GLTF_CDN:       "https://esm.sh/three@0.169.0/examples/jsm/loaders/GLTFLoader.js",
-    ELEVENLABS_CDN: "https://cdn.jsdelivr.net/npm/@elevenlabs/client@latest/+esm",
+    THREE_CDN:        "https://esm.sh/three@0.169.0",
+    GLTF_CDN:         "https://esm.sh/three@0.169.0/examples/jsm/loaders/GLTFLoader.js",
+    VRM_CDN:          "https://esm.sh/@pixiv/three-vrm@2?deps=three@0.169.0",
+    ELEVENLABS_CDN:   "https://cdn.jsdelivr.net/npm/@elevenlabs/client@latest/+esm",
+    MEDIAPIPE_CDN:    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/+esm",
+    MEDIAPIPE_WASM:   "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm",
+    MP_MODEL_URL:     "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
 
     STATUS_LABELS: Object.freeze({
       idle:       "Click to start",
@@ -586,27 +590,225 @@
   })();
 
   // ════════════════════════════════════════════════════════════════════════════
-  // MODULE: PhotoAvatar — portrait image + canvas speaking-effects overlay
+  // MODULE: PhotoAvatar
+  // Portrait rendered as a WebGL texture on a Three.js full-screen quad.
+  // A GLSL fragment shader physically warps the lower-lip pixel region downward
+  // when lipAmp increases, revealing a dark mouth-cavity beneath.
+  // Actual image pixels move — no overlay shapes, no seams.
+  //
+  // MediaPipe FaceLandmarker runs once on image load to detect exact mouth
+  // landmarks (uv fractions). Falls back to DEFAULT_MOUTH if detection fails.
+  //
+  // The visible canvas keeps a 2D context for overlay effects (blink, glow,
+  // waveform). The WebGL shader renders to a secondary offscreen canvas which
+  // is blitted to the visible canvas each frame before overlays are drawn.
   // ════════════════════════════════════════════════════════════════════════════
   const PhotoAvatar = (() => {
-    let _canvas = null;
-    let _ctx    = null;
-    let _rafId  = null;
-    let _time   = 0;
-    let _ringsPool = [];   // active expanding rings
+    // UV y=0 = visual bottom, y=1 = visual top (Three.js flipY=true + WebGL→canvas blit)
+    // Mouth at 72% from visual top = 28% from visual bottom → cy = 0.28
+    const DEFAULT_MOUTH = Object.freeze({ cx: 0.50, cy: 0.28, hw: 0.120 });
+    const MAX_GAP       = 0.034;  // maximum UV-space gap when lipAmp = 1
 
-    function init(canvas, photoBgEl, imageUrl) {
+    // ── GLSL shaders ─────────────────────────────────────────────────────────
+    const VERT_SRC = `
+      varying vec2 vUv;
+      void main() {
+        vUv         = uv;
+        gl_Position = vec4(position.xy, 0.0, 1.0);
+      }
+    `;
+
+    // Gaussian horizontal mask + inverse-UV displacement + dark cavity with teeth
+    const FRAG_SRC = `
+      uniform sampler2D uPortrait;
+      uniform bool      uReady;
+      uniform float     uLipAmp;
+      uniform float     uMouthCX;
+      uniform float     uMouthCY;
+      uniform float     uMouthHW;
+      uniform float     uMaxGap;
+      varying vec2 vUv;
+
+      void main() {
+        if (!uReady) {
+          gl_FragColor = vec4(0.035, 0.035, 0.055, 1.0);
+          return;
+        }
+
+        float gap = uMaxGap * uLipAmp;
+
+        // Gaussian horizontal mask — tapers to 0 beyond mouth corners
+        float dx    = (vUv.x - uMouthCX) / max(uMouthHW, 0.001);
+        float hMask = exp(-dx * dx * 2.5);
+
+        float halfGap   = gap * 0.5 * hMask;
+        float cavityBot = uMouthCY - halfGap;   // lower lip moved down (smaller UV y)
+        float cavityTop = uMouthCY + halfGap;   // upper lip moved up   (larger UV y)
+
+        if (hMask > 0.04 && vUv.y > cavityBot && vUv.y < cavityTop) {
+          // Inside cavity: bright teeth in upper region, dark below
+          float t      = (vUv.y - cavityBot) / max(cavityTop - cavityBot, 0.0001);
+          float teethA = smoothstep(0.35, 0.70, t) * hMask * min(1.0, uLipAmp * 3.0);
+          vec3 dark    = vec3(0.035, 0.014, 0.010);
+          vec3 teeth   = vec3(0.940, 0.920, 0.880);
+          gl_FragColor = vec4(mix(dark, teeth, teethA), 1.0);
+        } else {
+          vec2 sUv = vUv;
+          if (vUv.y >= cavityTop) {
+            // Upper lip moved up — pull sample back to original position (below)
+            float dist    = vUv.y - cavityTop;
+            float falloff = exp(-dist / max(halfGap * 3.0, 0.001)) * hMask;
+            sUv.y         = vUv.y - halfGap * falloff;
+          } else if (vUv.y <= cavityBot) {
+            // Lower lip moved down — pull sample back up
+            float dist    = cavityBot - vUv.y;
+            float falloff = exp(-dist / max(halfGap * 3.0, 0.001)) * hMask;
+            sUv.y         = vUv.y + halfGap * falloff;
+          }
+          gl_FragColor = texture2D(uPortrait, clamp(sUv, 0.001, 0.999));
+        }
+      }
+    `;
+
+    // ── WebGL / Three.js state ────────────────────────────────────────────────
+    let _glCanvas  = null;
+    let _renderer  = null;
+    let _scene     = null;
+    let _camera    = null;
+    let _material  = null;
+    let _texture   = null;
+    let _THREE     = null;
+
+    // ── Visible canvas / 2D overlay state ────────────────────────────────────
+    let _canvas    = null;
+    let _ctx       = null;
+    let _rafId     = null;
+    let _time      = 0;
+    let _mouth     = { ...DEFAULT_MOUTH };
+    let _blinkT    = 0;
+    let _nextBlink = 3.0 + Math.random() * 2.5;
+    let _blinkPhase = 0;
+    let _ringsPool = [];
+    let _detecting = false;
+    let _ready     = false;
+
+    // ── Public: init ─────────────────────────────────────────────────────────
+    async function init(canvas, photoBgEl, imageUrl) {
       _canvas = canvas;
       _ctx    = canvas.getContext("2d");
+      _mouth  = { ...DEFAULT_MOUTH };
+      _ready  = false;
 
-      // Show portrait image as CSS background
-      photoBgEl.style.backgroundImage = `url(${imageUrl})`;
-      photoBgEl.style.display = "block";
+      // Portrait rendered via WebGL — hide the CSS background div
+      if (photoBgEl) {
+        photoBgEl.style.backgroundImage = "none";
+        photoBgEl.style.display         = "none";
+      }
 
-      // Canvas is transparent overlay on top of the photo
+      _glCanvas        = document.createElement("canvas");
+      _glCanvas.width  = canvas.width;
+      _glCanvas.height = canvas.height;
+
+      _THREE = await import(Config.THREE_CDN);
+      _setupWebGL(_THREE, canvas.width, canvas.height);
+      await _loadTexture(imageUrl);
       _startLoop();
     }
 
+    // ── WebGL setup ───────────────────────────────────────────────────────────
+    function _setupWebGL(THREE, W, H) {
+      _renderer = new THREE.WebGLRenderer({ canvas: _glCanvas, antialias: false, alpha: false });
+      _renderer.setPixelRatio(1);
+      _renderer.setSize(W, H);
+
+      _scene  = new THREE.Scene();
+      _camera = new THREE.OrthographicCamera(-1, 1, 1, -1, 0, 1);
+
+      const geo = new THREE.PlaneGeometry(2, 2);
+      _material = new THREE.ShaderMaterial({
+        vertexShader:   VERT_SRC,
+        fragmentShader: FRAG_SRC,
+        uniforms: {
+          uPortrait: { value: null  },
+          uReady:    { value: false },
+          uLipAmp:   { value: 0.0  },
+          uMouthCX:  { value: _mouth.cx },
+          uMouthCY:  { value: _mouth.cy },
+          uMouthHW:  { value: _mouth.hw },
+          uMaxGap:   { value: MAX_GAP   },
+        },
+      });
+      const mesh = new THREE.Mesh(geo, _material);
+      mesh.frustumCulled = false;
+      _scene.add(mesh);
+    }
+
+    // ── Texture loading ───────────────────────────────────────────────────────
+    async function _loadTexture(url) {
+      return new Promise((resolve) => {
+        const loader = new _THREE.TextureLoader();
+        loader.load(
+          url,
+          (tex) => {
+            if (_texture) _texture.dispose();
+            _texture  = tex;
+            _material.uniforms.uPortrait.value = tex;
+            _material.uniforms.uReady.value    = true;
+            _ready = true;
+            resolve();
+            _detectMouthFromUrl(url);
+          },
+          undefined,
+          () => { _ready = false; resolve(); }
+        );
+      });
+    }
+
+    // ── Face detection ────────────────────────────────────────────────────────
+    function _detectMouthFromUrl(url) {
+      if (_detecting) return;
+      _detecting = true;
+      const img       = new Image();
+      img.crossOrigin = "anonymous";
+      img.onload      = () => _detectMouth(img).finally(() => { _detecting = false; });
+      img.onerror     = () => { _detecting = false; };
+      img.src         = url;
+    }
+
+    async function _detectMouth(imgEl) {
+      try {
+        const { FaceLandmarker, FilesetResolver } = await import(Config.MEDIAPIPE_CDN);
+        const vision   = await FilesetResolver.forVisionTasks(Config.MEDIAPIPE_WASM);
+        const detector = await FaceLandmarker.createFromOptions(vision, {
+          baseOptions: { modelAssetPath: Config.MP_MODEL_URL, delegate: "CPU" },
+          runningMode: "IMAGE",
+          numFaces:    1,
+        });
+        const result = detector.detect(imgEl);
+        detector.close();
+
+        if (!result.faceLandmarks?.length) return;
+        const lm = result.faceLandmarks[0];
+
+        // 13 = upper lip centre, 14 = lower lip, 61 = left corner, 291 = right corner
+        const ul = lm[13], ll = lm[14], lc = lm[61], rc = lm[291];
+        // MediaPipe y is fraction from image top; UV y=0 = visual bottom → flip
+        _mouth = {
+          cx: (lc.x + rc.x) / 2,
+          cy: 1.0 - (ul.y + ll.y) / 2,
+          hw: Math.abs(rc.x - lc.x) / 2 * 1.15,
+        };
+        if (_material) {
+          _material.uniforms.uMouthCX.value = _mouth.cx;
+          _material.uniforms.uMouthCY.value = _mouth.cy;
+          _material.uniforms.uMouthHW.value = _mouth.hw;
+        }
+      } catch {
+        // MediaPipe unavailable — DEFAULT_MOUTH uniforms remain
+      }
+    }
+
+    // ── RAF loop ──────────────────────────────────────────────────────────────
     function _startLoop() {
       let last = performance.now();
       const tick = (now) => {
@@ -614,86 +816,127 @@
         const dt = Math.min((now - last) / 1000, 0.05);
         last = now;
         _time += dt;
-        _drawEffects(dt);
+        _advanceBlink(dt);
+        _drawFrame(dt);
       };
       _rafId = requestAnimationFrame(tick);
     }
 
-    function _drawEffects(dt) {
-      if (!_canvas || !_ctx) return;
+    // ── Blink state machine ───────────────────────────────────────────────────
+    function _advanceBlink(dt) {
+      _blinkT += dt;
+      if (_blinkPhase === 0 && _blinkT >= _nextBlink) {
+        _blinkT     = 0;
+        _nextBlink  = 3.2 + Math.random() * 3.8;
+        _blinkPhase = 0.001;
+      }
+      if (_blinkPhase > 0) {
+        _blinkPhase = Math.min(1, _blinkPhase + dt / 0.072);
+        if (_blinkPhase >= 1) _blinkPhase = -0.001;
+      } else if (_blinkPhase < 0) {
+        _blinkPhase = Math.max(-1, _blinkPhase - dt / 0.072);
+        if (_blinkPhase <= -1) _blinkPhase = 0;
+      }
+    }
 
+    function _blinkIntensity() {
+      if (_blinkPhase > 0) return _blinkPhase;
+      if (_blinkPhase < 0) return 1 + _blinkPhase;
+      return 0;
+    }
+
+    // ── Draw frame: WebGL → blit → 2D overlays ───────────────────────────────
+    function _drawFrame(dt) {
+      if (!_canvas || !_ctx) return;
       const W = _canvas.width;
       const H = _canvas.height;
-      _ctx.clearRect(0, 0, W, H);
 
-      const mode    = State.get("mode");
-      const lipAmp  = State.get("lipAmp");
-      const cx      = W / 2;
-      const cy      = H * 0.42;     // approximate face centre in a portrait
-      const faceR   = Math.min(W, H) * 0.34;
+      if (_ready && _renderer && _material) {
+        _material.uniforms.uLipAmp.value = State.get("lipAmp");
+        _renderer.render(_scene, _camera);
+        _ctx.drawImage(_glCanvas, 0, 0);
+      } else {
+        _ctx.clearRect(0, 0, W, H);
+      }
 
-      // ── Ambient glow ring (always present when not idle) ──
+      const mode   = State.get("mode");
+      const lipAmp = State.get("lipAmp");
+      _drawBlinkOverlay(W, H, _blinkIntensity());
+      _drawGlowEffects(W, H, mode, lipAmp, dt);
+    }
+
+    function _drawBlinkOverlay(W, H, intensity) {
+      if (intensity < 0.02) return;
+      const eyeTopY = H * 0.24;
+      const eyeH    = H * 0.18;
+      const g = _ctx.createLinearGradient(0, eyeTopY, 0, eyeTopY + eyeH);
+      g.addColorStop(0,    `rgba(6,6,14,${intensity * 0.15})`);
+      g.addColorStop(0.30, `rgba(6,6,14,${intensity * 0.92})`);
+      g.addColorStop(0.70, `rgba(6,6,14,${intensity * 0.92})`);
+      g.addColorStop(1,    `rgba(6,6,14,${intensity * 0.15})`);
+      _ctx.fillStyle = g;
+      _ctx.fillRect(0, eyeTopY, W, eyeH);
+    }
+
+    function _drawGlowEffects(W, H, mode, lipAmp, dt) {
+      const cx    = W / 2;
+      // Convert UV y → screen fraction from top: screenFrac = 1 - _mouth.cy
+      // Face-glow centre is 28% above the mouth in screen space
+      const cy    = H * (1.0 - _mouth.cy - 0.28);
+      const faceR = Math.min(W, H) * 0.32;
+
       if (mode !== "idle") {
-        const glowAlpha = mode === "speaking" ? 0.22 + lipAmp * 0.18 : 0.12;
-        const glow = _ctx.createRadialGradient(cx, cy, faceR * 0.7, cx, cy, faceR * 1.4);
-        glow.addColorStop(0, `rgba(99,102,241,${glowAlpha})`);
-        glow.addColorStop(0.5, `rgba(14,165,233,${glowAlpha * 0.5})`);
-        glow.addColorStop(1, "rgba(20,184,166,0)");
+        const ga  = mode === "speaking" ? 0.16 + lipAmp * 0.14 : 0.09;
+        const grd = _ctx.createRadialGradient(cx, cy, faceR * 0.65, cx, cy, faceR * 1.35);
+        grd.addColorStop(0,   `rgba(99,102,241,${ga})`);
+        grd.addColorStop(0.5, `rgba(14,165,233,${ga * 0.42})`);
+        grd.addColorStop(1,   "rgba(20,184,166,0)");
         _ctx.beginPath();
-        _ctx.arc(cx, cy, faceR * 1.4, 0, Math.PI * 2);
-        _ctx.fillStyle = glow;
+        _ctx.arc(cx, cy, faceR * 1.35, 0, Math.PI * 2);
+        _ctx.fillStyle = grd;
         _ctx.fill();
       }
 
-      // ── Listening: scanning ring ──
       if (mode === "listening") {
-        const scanAlpha = 0.3 + Math.sin(_time * 3.0) * 0.12;
+        const a = 0.27 + Math.sin(_time * 3.0) * 0.10;
         _ctx.beginPath();
-        _ctx.arc(cx, cy, faceR + 6, 0, Math.PI * 2);
-        _ctx.strokeStyle = `rgba(96,165,250,${scanAlpha})`;
-        _ctx.lineWidth = 1.5;
+        _ctx.arc(cx, cy, faceR + 5, 0, Math.PI * 2);
+        _ctx.strokeStyle = `rgba(96,165,250,${a})`;
+        _ctx.lineWidth   = 1.5;
         _ctx.stroke();
       }
 
-      // ── Speaking: expanding rings + waveform bars ──
       if (mode === "speaking") {
-        // Spawn new ring on beat
-        if (lipAmp > 0.35 && Math.random() < 0.08) {
-          _ringsPool.push({ r: faceR, alpha: 0.55, life: 1.0 });
+        if (lipAmp > 0.32 && Math.random() < 0.07) {
+          _ringsPool.push({ r: faceR, life: 1.0 });
         }
-        // Draw and age rings
         _ringsPool = _ringsPool.filter(ring => {
-          ring.r    += dt * 90;
-          ring.alpha = ring.life * 0.55;
+          ring.r    += dt * 88;
           ring.life -= dt * 1.8;
-
           if (ring.life <= 0) return false;
-
           _ctx.beginPath();
           _ctx.arc(cx, cy, ring.r, 0, Math.PI * 2);
-          _ctx.strokeStyle = `rgba(99,102,241,${ring.alpha})`;
+          _ctx.strokeStyle = `rgba(99,102,241,${ring.life * 0.50})`;
           _ctx.lineWidth   = 1.5;
           _ctx.stroke();
           return true;
         });
-
-        // Waveform bars at bottom of avatar zone
         _drawWaveformBars(W, H, lipAmp);
       }
     }
 
     function _drawWaveformBars(W, H, amplitude) {
-      const numBars  = 24;
-      const barW     = 2.5;
-      const barGap   = 2.5;
-      const totalW   = numBars * (barW + barGap);
-      const startX   = (W - totalW) / 2;
-      const baseY    = H - 14;
-      const maxH     = 32 * amplitude;
+      const numBars = 24;
+      const barW    = 2.5;
+      const barGap  = 2.5;
+      const totalW  = numBars * (barW + barGap);
+      const startX  = (W - totalW) / 2;
+      const baseY   = H - 14;
+      const maxH    = 32 * amplitude;
 
       for (let i = 0; i < numBars; i++) {
-        const centreNorm = Math.abs((i / (numBars - 1)) - 0.5) * 2; // 0 at centre, 1 at edges
-        const envH = maxH * (1 - centreNorm * 0.55) * (0.45 + 0.55 * Math.random());
+        const norm = Math.abs((i / (numBars - 1)) - 0.5) * 2;
+        const envH = maxH * (1 - norm * 0.55) * (0.45 + 0.55 * Math.random());
         const x    = startX + i * (barW + barGap);
         const grad = _ctx.createLinearGradient(0, baseY - envH, 0, baseY);
         grad.addColorStop(0, "rgba(14,165,233,0.9)");
@@ -709,26 +952,36 @@
       }
     }
 
-    function switchImage(photoBgEl, imageUrl) {
-      if (!photoBgEl) return;
-      photoBgEl.style.backgroundImage = `url(${imageUrl})`;
+    // ── Public: switchImage, resize, destroy ─────────────────────────────────
+    async function switchImage(_photoBgEl, imageUrl) {
+      _mouth = { ...DEFAULT_MOUTH };
+      _ready = false;
+      if (_material) {
+        _material.uniforms.uMouthCX.value = _mouth.cx;
+        _material.uniforms.uMouthCY.value = _mouth.cy;
+        _material.uniforms.uMouthHW.value = _mouth.hw;
+        _material.uniforms.uReady.value   = false;
+      }
+      await _loadTexture(imageUrl);
     }
 
     function resize(w, h) {
-      if (!_canvas) return;
-      _canvas.width  = w;
-      _canvas.height = h;
+      if (_canvas)   { _canvas.width = w; _canvas.height = h; }
+      if (_glCanvas) { _glCanvas.width = w; _glCanvas.height = h; }
+      if (_renderer) { _renderer.setSize(w, h); }
     }
 
     function destroy() {
-      if (_rafId) { cancelAnimationFrame(_rafId); _rafId = null; }
+      if (_rafId)    { cancelAnimationFrame(_rafId); _rafId = null; }
+      if (_texture)  { _texture.dispose(); _texture = null; }
+      if (_renderer) { _renderer.dispose(); _renderer = null; }
     }
 
     return { init, switchImage, resize, destroy };
   })();
 
   // ════════════════════════════════════════════════════════════════════════════
-  // MODULE: ThreeAvatar — Three.js procedural face with jaw lip-sync
+  // MODULE: ThreeAvatar — Three.js face: VRM avatar, RPM GLB, or procedural fallback
   // ════════════════════════════════════════════════════════════════════════════
   const ThreeAvatar = (() => {
     let _renderer  = null;
@@ -738,14 +991,22 @@
     let _rafId     = null;
     let _ready     = false;
 
-    // Face handles
+    // Procedural face handles
     let _jawGroup  = null;
     let _headGroup = null;
     let _leftLid   = null;
     let _rightLid  = null;
-    let _headMesh  = null;   // RPM morph-target mesh
 
-    const VISEMES = [
+    // RPM GLB handle
+    let _headMesh  = null;
+
+    // VRM handle — set when a .vrm file is loaded
+    let _vrm       = null;
+
+    // VRM mouth expression names (three-vrm preset names, work for both VRM 0.x and 1.0)
+    const VRM_VOWELS = ["aa", "ih", "ou", "ee", "oh"];
+
+    const RPM_VISEMES = [
       "viseme_sil","viseme_PP","viseme_FF","viseme_TH","viseme_DD",
       "viseme_kk","viseme_CH","viseme_SS","viseme_nn","viseme_RR",
       "viseme_aa","viseme_E","viseme_I","viseme_O","viseme_U",
@@ -775,7 +1036,11 @@
         _addSceneBackground(THREE);
 
         if (Config.AVATAR_URL) {
-          await _loadRpmAvatar(THREE, canvas);
+          if (Config.AVATAR_URL.toLowerCase().endsWith(".vrm")) {
+            await _loadVrmAvatar(THREE, Config.AVATAR_URL);
+          } else {
+            await _loadRpmAvatar(THREE, canvas);
+          }
         } else {
           _buildFace(THREE);
         }
@@ -999,6 +1264,39 @@
       }
     }
 
+    async function _loadVrmAvatar(THREE, url) {
+      try {
+        const { GLTFLoader }     = await import(Config.GLTF_CDN);
+        const { VRMLoaderPlugin } = await import(Config.VRM_CDN);
+
+        const loader = new GLTFLoader();
+        loader.register(parser => new VRMLoaderPlugin(parser));
+
+        return new Promise((resolve) => {
+          loader.load(
+            url,
+            (gltf) => {
+              _vrm = gltf.userData.vrm;
+              if (!_vrm) { _buildFace(THREE); resolve(); return; }
+
+              // VRM models face +Z by default; rotate to face the camera
+              _vrm.scene.rotation.y = Math.PI;
+              _scene.add(_vrm.scene);
+
+              // Frame for a head-and-shoulders portrait
+              _camera.position.set(0, 1.42, 0.72);
+              _camera.lookAt(0, 1.30, 0);
+              resolve();
+            },
+            undefined,
+            () => { _buildFace(THREE); resolve(); }
+          );
+        });
+      } catch {
+        _buildFace(THREE);
+      }
+    }
+
     function _startRenderLoop(THREE) {
       const tick = () => {
         _rafId = requestAnimationFrame(tick);
@@ -1013,39 +1311,43 @@
     }
 
     function _updateLipSync(dt) {
-      const speaking = State.get("mode") === "speaking";
+      // LipSyncEngine owns lipAmp (real ElevenLabs audio or sinusoidal fallback).
+      // ThreeAvatar just reads the value and applies it to whatever face is loaded.
+      const lipAmp  = State.get("lipAmp");
       let lipPhase  = State.get("lipPhase");
-      let lipAmp    = State.get("lipAmp");
-      let lipTarget = State.get("lipTarget");
-
-      if (speaking) {
+      if (State.get("mode") === "speaking") {
         lipPhase += dt * 28.5;
-        const syllable = Math.max(0, Math.sin(lipPhase));
-        const noise    = (Math.random() - 0.5) * 0.18;
-        lipTarget = Math.min(1, Math.max(0, 0.22 + syllable * 0.62 + noise));
-        lipAmp += (lipTarget - lipAmp) * Math.min(1, dt * 20);
-      } else {
-        lipAmp = Math.max(0, lipAmp - dt * 12);
+        State.set("lipPhase", lipPhase);
       }
 
-      State.set("lipPhase",  lipPhase);
-      State.set("lipAmp",    lipAmp);
-      State.set("lipTarget", lipTarget);
-
+      // ── Procedural jaw ────────────────────────────────────────────────────
       if (_jawGroup) _jawGroup.rotation.x = lipAmp * 0.28;
 
+      // ── RPM / GLB morph targets ───────────────────────────────────────────
       if (_headMesh) {
         const dict = _headMesh.morphTargetDictionary;
         const infl = _headMesh.morphTargetInfluences;
-        VISEMES.forEach(v => { const i = dict[v]; if (i !== undefined) infl[i] = 0; });
+        RPM_VISEMES.forEach(v => { const i = dict[v]; if (i !== undefined) infl[i] = 0; });
         if (lipAmp > 0.01) {
           const aaI = dict["viseme_aa"];
           if (aaI !== undefined) infl[aaI] = lipAmp * 0.88;
-          const vowels = ["viseme_E","viseme_I","viseme_O","viseme_U"];
-          const vSel = vowels[Math.floor((lipPhase * 0.25) % vowels.length)];
+          const vowels = ["viseme_E", "viseme_I", "viseme_O", "viseme_U"];
+          const vSel   = vowels[Math.floor((lipPhase * 0.25) % vowels.length)];
           const vI = dict[vSel];
-          if (vI !== undefined) infl[vI] = lipAmp * 0.3;
+          if (vI !== undefined) infl[vI] = lipAmp * 0.30;
         }
+      }
+
+      // ── VRM expressions ───────────────────────────────────────────────────
+      if (_vrm && _vrm.expressionManager) {
+        const em = _vrm.expressionManager;
+        VRM_VOWELS.forEach(e => { try { em.setValue(e, 0); } catch { /* unsupported */ } });
+        if (lipAmp > 0.01) {
+          try { em.setValue("aa", lipAmp * 0.90); } catch { /* unsupported */ }
+          const secondary = VRM_VOWELS[Math.floor((lipPhase * 0.25) % VRM_VOWELS.length)];
+          try { em.setValue(secondary, lipAmp * 0.22); } catch { /* unsupported */ }
+        }
+        em.update();
       }
     }
 
@@ -1053,6 +1355,7 @@
       const t = State.get("idleTime") + dt;
       State.set("idleTime", t);
 
+      // Subtle head sway for procedural and RPM faces
       if (_headGroup) {
         _headGroup.rotation.y = Math.sin(t * 0.22) * 0.04;
         _headGroup.rotation.z = Math.sin(t * 0.17) * 0.022;
@@ -1063,7 +1366,14 @@
         _headMesh.parent.rotation.z = Math.sin(t * 0.17) * 0.018;
       }
 
-      // Blink
+      // Subtle head sway for VRM (applied to the VRM scene root)
+      if (_vrm) {
+        _vrm.scene.rotation.y = Math.PI + Math.sin(t * 0.22) * 0.04;
+        _vrm.scene.rotation.z = Math.sin(t * 0.17) * 0.018;
+        _vrm.update(dt);  // drives spring bones, look-at, and auto expressions
+      }
+
+      // Blink timer
       let blinkTimer = State.get("blinkTimer") + dt;
       const nextBlink = State.get("nextBlink");
       State.set("blinkTimer", blinkTimer);
@@ -1077,13 +1387,17 @@
 
     function _triggerBlink() {
       State.set("blinking", true);
-      const start = performance.now();
+      const start    = performance.now();
       const DURATION = 150;
       const step = () => {
         const p = (performance.now() - start) / DURATION;
         const v = p < 0.45 ? p / 0.45 : p < 1 ? 1 - (p - 0.45) / 0.55 : 0;
+
+        // Procedural eyelids
         if (_leftLid)  _leftLid.scale.y  = v;
         if (_rightLid) _rightLid.scale.y = v;
+
+        // RPM blink morph targets
         if (_headMesh) {
           const dict = _headMesh.morphTargetDictionary;
           const infl = _headMesh.morphTargetInfluences;
@@ -1092,6 +1406,14 @@
           if (lI !== undefined) infl[lI] = v;
           if (rI !== undefined) infl[rI] = v;
         }
+
+        // VRM blink expressions
+        if (_vrm && _vrm.expressionManager) {
+          try { _vrm.expressionManager.setValue("blinkLeft",  v); } catch { /* unsupported */ }
+          try { _vrm.expressionManager.setValue("blinkRight", v); } catch { /* unsupported */ }
+          _vrm.expressionManager.update();
+        }
+
         if (p < 1) requestAnimationFrame(step);
         else State.set("blinking", false);
       };
@@ -1113,8 +1435,13 @@
   // (ThreeAvatar drives its own lipAmp internally in the render loop)
   // ════════════════════════════════════════════════════════════════════════════
   const LipSyncEngine = (() => {
-    let _rafId    = null;
-    let _lastTime = 0;
+    let _rafId       = null;
+    let _lastTime    = 0;
+    let _getFreqData = null;   // () => Uint8Array|null — real ElevenLabs output
+
+    function setAudioSource(fn) {
+      _getFreqData = fn;
+    }
 
     function start() {
       if (_rafId) return;
@@ -1130,30 +1457,48 @@
 
     function _update(dt) {
       const speaking = State.get("mode") === "speaking";
-      let lipPhase  = State.get("lipPhase");
       let lipAmp    = State.get("lipAmp");
-      let lipTarget = State.get("lipTarget");
 
       if (speaking) {
-        lipPhase += dt * 28.5;
-        const syllable = Math.max(0, Math.sin(lipPhase));
-        const noise    = (Math.random() - 0.5) * 0.18;
-        lipTarget = Math.min(1, Math.max(0, 0.22 + syllable * 0.62 + noise));
-        lipAmp += (lipTarget - lipAmp) * Math.min(1, dt * 20);
+        let amplitude = 0;
+
+        // Try real ElevenLabs output audio frequency data first
+        if (_getFreqData) {
+          try {
+            const freq = _getFreqData();
+            if (freq && freq.length > 0) {
+              // Sum speech-range bins (~150–3500 Hz with typical 44.1kHz / 1024-bin FFT)
+              let sum = 0;
+              const lo = 4, hi = Math.min(85, freq.length);
+              for (let i = lo; i < hi; i++) sum += freq[i];
+              amplitude = Math.min(1, (sum / ((hi - lo) * 255)) * 2.8);
+            }
+          } catch { /* SDK not ready yet */ }
+        }
+
+        // Fall back to sinusoidal syllable simulation when no real data
+        if (amplitude < 0.02) {
+          let lipPhase = State.get("lipPhase");
+          lipPhase += dt * 28.5;
+          const syllable = Math.max(0, Math.sin(lipPhase));
+          const noise    = (Math.random() - 0.5) * 0.18;
+          amplitude = Math.min(1, Math.max(0, 0.22 + syllable * 0.62 + noise));
+          State.set("lipPhase", lipPhase);
+        }
+
+        lipAmp += (amplitude - lipAmp) * Math.min(1, dt * 22);
       } else {
         lipAmp = Math.max(0, lipAmp - dt * 12);
       }
 
-      State.set("lipPhase",  lipPhase);
-      State.set("lipAmp",    lipAmp);
-      State.set("lipTarget", lipTarget);
+      State.set("lipAmp", lipAmp);
     }
 
     function stop() {
       if (_rafId) { cancelAnimationFrame(_rafId); _rafId = null; }
     }
 
-    return { start, stop };
+    return { setAudioSource, start, stop };
   })();
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -1303,7 +1648,12 @@
 
     function isActive() { return _session !== null; }
 
-    return { start, end, setVolume, isActive };
+    function getOutputFreqData() {
+      if (!_session) return null;
+      try { return _session.getOutputByteFrequencyData(); } catch { return null; }
+    }
+
+    return { start, end, setVolume, isActive, getOutputFreqData };
   })();
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -1317,6 +1667,9 @@
     async function init() {
       const built = DOMBuilder.build();
       _refs = built.refs;
+
+      // Wire real ElevenLabs output audio into the photo-mode lip sync engine
+      LipSyncEngine.setAudioSource(Conversation.getOutputFreqData);
 
       _wireEvents();
       _syncStateToDOM();
@@ -1427,7 +1780,7 @@
         // Photo mode — canvas is a transparent overlay for speaking effects
         canvas.width  = W;
         canvas.height = H;
-        PhotoAvatar.init(canvas, _refs.photoBg, photoUrl);
+        await PhotoAvatar.init(canvas, _refs.photoBg, photoUrl);
 
         // Sync selector to the chosen URL if it wasn't already
         if (_refs.selector && _refs.selector.value !== photoUrl) {
@@ -1439,10 +1792,11 @@
         _refs.loading.classList.add("hidden");
 
       } else {
-        // Three.js mode (RPM GLB or procedural face)
+        // Three.js mode (VRM, RPM GLB, or procedural face)
         canvas.width  = W;
         canvas.height = H;
         await ThreeAvatar.init(canvas);
+        LipSyncEngine.start();   // feeds real ElevenLabs audio into State.lipAmp
         _avatarMode = "three";
         if (ThreeAvatar.isReady()) {
           _refs.loading.classList.add("hidden");
