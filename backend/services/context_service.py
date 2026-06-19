@@ -23,6 +23,6 @@ class ContextService:
             parts.append(f"\nPage Content:\n{content[:max_chars]}")
         if extra:
             serialised = json.dumps(extra, indent=2, default=str)
-            parts.append(f"\nApp Data:\n{serialised[:2000]}")
+            parts.append(f"\nApp Data:\n{serialised[:4000]}")
 
         return "\n".join(parts) if parts else "No page context captured."

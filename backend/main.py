@@ -17,7 +17,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from backend.container import Container
-from backend.routes import admin_routes, api_routes, avatars_route, health_route, widget_route
+from backend.routes import (
+    admin_routes,
+    api_routes,
+    avatars_route,
+    health_route,
+    widget_route,
+)
 
 _STATIC_DIR = Path(__file__).parent.parent / "static"
 

@@ -13,3 +13,32 @@ dependencies = [
     "python-dotenv>=1.2.2",
     "uvicorn[standard]>=0.49.0",
 ]
+
+[dependency-groups]
+dev = [
+    "bandit>=1.9.0",
+    "commitizen>=4.16.0",
+    "detect-secrets>=1.5.0",
+    "pre-commit>=4.0.0",
+    "ruff>=0.9.0",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+ignore = ["E501"]
+
+[tool.bandit]
+exclude_dirs = ["tests", "scripts"]
+skips = [
+    "B104",  # hardcoded bind-all — intentional for dev server
+    "B105",  # hardcoded_password_string — false positive on URL constants
+    "B110",  # try/except pass — intentional resilience in scrapers
+    "B603",  # subprocess without shell — all calls use lists (safe)
+    "B607",  # partial path subprocess — same reason as B603
+]
+
+[tool.commitizen]
+name = "cz_conventional_commits"
+version_provider = "pep621"
+tag_format = "v$version"
+update_changelog_on_bump = true

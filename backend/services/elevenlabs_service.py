@@ -16,7 +16,9 @@ class ElevenLabsService:
     async def fetch_conversation_token(self, agent_id: str) -> str:
         api_key = self._config.get_api_key()
         if not api_key:
-            raise HTTPException(status_code=500, detail="ELEVENLABS_API_KEY not configured.")
+            raise HTTPException(
+                status_code=500, detail="ELEVENLABS_API_KEY not configured."
+            )
 
         async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
             try:
@@ -44,5 +46,7 @@ class ElevenLabsService:
 
         token: str = response.json().get("token", "")
         if not token:
-            raise HTTPException(status_code=502, detail="ElevenLabs returned an empty token.")
+            raise HTTPException(
+                status_code=502, detail="ElevenLabs returned an empty token."
+            )
         return token

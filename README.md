@@ -1,6 +1,6 @@
 # AI Avatar Plugin
 
-A standalone, embeddable AI voice assistant powered by ElevenLabs.  
+A standalone, embeddable AI voice assistant powered by ElevenLabs.
 Drop one `<script>` tag into **any** web app — it reads the page, answers questions by voice.
 
 ## Architecture
@@ -109,7 +109,7 @@ The function can return a value or a Promise.
 Returns `{ agent_name, ready }`.
 
 ### `POST /api/token`
-Body: `{ url, title, content, extra }`  
+Body: `{ url, title, content, extra }`
 Returns: `{ token, dynamic_variables }`
 
 ### `GET /api/admin/config`

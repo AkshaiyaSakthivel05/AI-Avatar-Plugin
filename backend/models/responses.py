@@ -1,10 +1,14 @@
 from typing import Any
+
 from pydantic import BaseModel
 
 
 class PublicConfigResponse(BaseModel):
     agent_name: str
     ready: bool
+    chat_enabled: bool = False
+    chat_models: list[str] = []
+    chat_default_model: str = ""
 
 
 class AdminConfigResponse(BaseModel):
@@ -39,3 +43,7 @@ class AvatarItem(BaseModel):
 
 class AvatarsResponse(BaseModel):
     avatars: list[AvatarItem]
+
+
+class ChatResponse(BaseModel):
+    reply: str

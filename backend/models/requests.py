@@ -1,4 +1,5 @@
 from typing import Optional
+
 from pydantic import BaseModel, Field
 
 
@@ -6,7 +7,31 @@ class TokenRequest(BaseModel):
     url: str = Field(default="", description="Current page URL")
     title: str = Field(default="", description="Current page title")
     content: str = Field(default="", description="Visible page text content")
-    extra: Optional[dict] = Field(default=None, description="Structured app data from registered sources")
+    extra: Optional[dict] = Field(
+        default=None, description="Structured app data from registered sources"
+    )
+
+
+class ChatMessage(BaseModel):
+    role: str = Field(description="'user' or 'assistant'")
+    content: str
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(description="The user's current message")
+    history: list[ChatMessage] = Field(
+        default_factory=list, description="Prior turns (up to 20)"
+    )
+    url: str = Field(default="", description="Current page URL")
+    title: str = Field(default="", description="Current page title")
+    content: str = Field(default="", description="Visible page text content")
+    extra: Optional[dict] = Field(
+        default=None, description="Structured app data from registered sources"
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description="Override the default chat model (OpenRouter model ID)",
+    )
 
 
 class ConfigUpdate(BaseModel):

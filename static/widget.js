@@ -25,6 +25,10 @@
 (function () {
   "use strict";
 
+  // Idempotency guard — React Strict Mode (and any other double-load scenario)
+  // causes this IIFE to run twice. Bail out if the widget host already exists.
+  if (document.getElementById("ai-avatar-plugin-host")) return;
+
   // ════════════════════════════════════════════════════════════════════════════
   // MODULE: Config
   // ════════════════════════════════════════════════════════════════════════════
@@ -55,12 +59,24 @@
     MP_MODEL_URL:     "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task",
 
     STATUS_LABELS: Object.freeze({
-      idle:       "Click to start",
-      connecting: "Connecting…",
-      listening:  "Listening…",
-      thinking:   "Thinking…",
-      speaking:   "Speaking…",
+      idle:         "Click to start",
+      connecting:   "Connecting…",
+      listening:    "Listening…",
+      thinking:     "Thinking…",
+      speaking:     "Speaking…",
+      "text-idle":  "Type a message",
+      "text-busy":  "Thinking…",
     }),
+
+    // Text-chat mode config — configurable per-dashboard via data-* attributes.
+    // data-chat-mode="false"    → disable text mode entirely (voice only)
+    // data-default-mode="text"  → open in text mode by default
+    CHAT_ENABLED: (_scriptEl && _scriptEl.getAttribute("data-chat-mode")) !== "false",
+    DEFAULT_INPUT_MODE: (_scriptEl && _scriptEl.getAttribute("data-default-mode")) === "text"
+      ? "text" : "voice",
+    // Optional per-embed model override (data-chat-model="cohere/north-mini-code:free").
+    // If unset, the widget uses whatever the backend returns as chat_default_model.
+    DEFAULT_CHAT_MODEL: (_scriptEl && _scriptEl.getAttribute("data-chat-model")) || null,
 
     PANEL_WIDTH: "clamp(280px, 25vw, 400px)",
     TAB_WIDTH:   "44px",
@@ -74,6 +90,7 @@
       isOpen:     false,
       isMuted:    false,
       mode:       "idle",         // idle | connecting | listening | thinking | speaking
+      inputMode:  Config.DEFAULT_INPUT_MODE,  // "voice" | "text"
       agentName:  Config.DISPLAY_NAME || "AI Assistant",
       lipAmp:     0,
       lipTarget:  0,
@@ -415,6 +432,30 @@
       animation: av-pulse 1s infinite;
     }
 
+    /* ── Mode-toggle button (voice ↔ text) ── */
+    .av-mode-btn {
+      width: 34px; height: 34px; border-radius: 50%;
+      border: 1px solid #1C1C2E; background: #0E0E1A;
+      cursor: pointer; display: flex; align-items: center; justify-content: center;
+      flex-shrink: 0; transition: background 0.15s, border-color 0.15s;
+    }
+    .av-mode-btn:hover { background: #1C1C2E; border-color: #6366f1; }
+    .av-mode-btn.text-active { background: #1A1A40; border-color: #6366f1; }
+    .av-mode-btn.hidden { display: none; }
+
+    /* ── Send button (text mode) ── */
+    .av-send-btn {
+      width: 38px; height: 38px; border-radius: 50%; border: none;
+      cursor: pointer; display: none; align-items: center; justify-content: center;
+      flex-shrink: 0;
+      background: linear-gradient(135deg, #4f46e5, #0ea5e9);
+      box-shadow: 0 4px 14px rgba(79,70,229,0.4);
+      transition: transform 0.15s, box-shadow 0.15s;
+    }
+    .av-send-btn.visible { display: flex; }
+    .av-send-btn:hover  { transform: scale(1.06); }
+    .av-send-btn:active { transform: scale(0.93); }
+
     /* ── Avatar selector strip ── */
     .av-selector-row {
       display: flex;
@@ -454,6 +495,18 @@
     .av-selector:hover  { border-color: #3b82f6; }
     .av-selector option { background: #0E0E1A; color: #C4C4DC; }
     .av-selector-row.hidden { display: none; }
+
+    /* ── Model selector row (text mode) ── */
+    .av-model-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 4px 14px 5px;
+      flex-shrink: 0;
+      border-bottom: 1px solid #0f0f1a;
+      background: #07070f;
+    }
+    .av-model-row.hidden { display: none; }
 
     /* ── Keyframes ── */
     @keyframes av-breathe  { 0%,100%{transform:scale(1)} 50%{transform:scale(1.05)} }
@@ -542,9 +595,41 @@
           <span class="av-hint-text" id="av-hint">Click avatar to start</span>
         </div>
 
+        <!-- Model picker — shown in text mode when multiple models are available -->
+        <div class="av-model-row hidden" id="av-model-row">
+          <span class="av-selector-label">Model</span>
+          <select class="av-selector" id="av-model-select"></select>
+        </div>
+
         <div class="av-transcript" id="av-transcript"></div>
 
         <div class="av-controls">
+          <!-- Mode toggle: keyboard icon = switch to text, mic icon = switch to voice.
+               Hidden entirely when data-chat-mode="false". -->
+          <button class="av-mode-btn${Config.CHAT_ENABLED ? "" : " hidden"}" id="av-mode"
+            title="Switch input mode">
+            <!-- Keyboard icon — shown in voice mode (click → text mode) -->
+            <svg id="av-mode-icon-text" width="15" height="15" viewBox="0 0 24 24"
+              fill="none" stroke="#6366f1" stroke-width="2">
+              <rect x="2" y="5" width="20" height="14" rx="2"/>
+              <line x1="6"  y1="9"  x2="6"  y2="9"/>
+              <line x1="10" y1="9"  x2="10" y2="9"/>
+              <line x1="14" y1="9"  x2="14" y2="9"/>
+              <line x1="18" y1="9"  x2="18" y2="9"/>
+              <line x1="6"  y1="13" x2="6"  y2="13"/>
+              <line x1="18" y1="13" x2="18" y2="13"/>
+              <line x1="10" y1="13" x2="14" y2="13"/>
+              <line x1="8"  y1="17" x2="16" y2="17"/>
+            </svg>
+            <!-- Mic icon — shown in text mode (click → voice mode) -->
+            <svg id="av-mode-icon-voice" width="14" height="14" viewBox="0 0 24 24"
+              fill="none" stroke="#6366f1" stroke-width="2.2" style="display:none">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+              <line x1="12" y1="19" x2="12" y2="23"/>
+              <line x1="8"  y1="23" x2="16" y2="23"/>
+            </svg>
+          </button>
           <button class="av-mute-btn" id="av-mute" title="Toggle mute">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#404060" stroke-width="2">
               <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
@@ -554,12 +639,19 @@
           </button>
           <input class="av-input" id="av-input" type="text"
             placeholder="Ask anything…" autocomplete="off"/>
-          <button class="av-call-btn" id="av-call" title="Start / end conversation">
+          <button class="av-call-btn" id="av-call" title="Start / end voice call">
             <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2">
               <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
               <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
               <line x1="12" y1="19" x2="12" y2="23"/>
               <line x1="8"  y1="23" x2="16" y2="23"/>
+            </svg>
+          </button>
+          <!-- Send button — visible only in text mode -->
+          <button class="av-send-btn" id="av-send" title="Send message">
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="#fff" stroke-width="2.2">
+              <line x1="22" y1="2" x2="11" y2="13"/>
+              <polygon points="22 2 15 22 11 13 2 9 22 2"/>
             </svg>
           </button>
         </div>
@@ -579,9 +671,15 @@
       _refs.status      = panel.querySelector("#av-status");
       _refs.hint        = panel.querySelector("#av-hint");
       _refs.transcript  = panel.querySelector("#av-transcript");
-      _refs.muteBtn     = panel.querySelector("#av-mute");
-      _refs.input       = panel.querySelector("#av-input");
-      _refs.callBtn     = panel.querySelector("#av-call");
+      _refs.modelRow      = panel.querySelector("#av-model-row");
+      _refs.modelSelect   = panel.querySelector("#av-model-select");
+      _refs.modeBtn       = panel.querySelector("#av-mode");
+      _refs.modeIconText  = panel.querySelector("#av-mode-icon-text");
+      _refs.modeIconVoice = panel.querySelector("#av-mode-icon-voice");
+      _refs.muteBtn       = panel.querySelector("#av-mute");
+      _refs.input         = panel.querySelector("#av-input");
+      _refs.callBtn       = panel.querySelector("#av-call");
+      _refs.sendBtn       = panel.querySelector("#av-send");
 
       return { shadow: _shadow, refs: _refs };
     }
@@ -1506,18 +1604,48 @@
   // ════════════════════════════════════════════════════════════════════════════
   const PageScraper = (() => {
     const _sources = {};
+    // Live context pushed from the host page via CustomEvent or pushContext().
+    // Source-fn results take priority; pushed values fill in when cache is empty.
+    const _pushed  = {};
+
+    window.addEventListener("ai-avatar:context-push", (e) => {
+      if (e.detail && typeof e.detail === "object") Object.assign(_pushed, e.detail);
+    });
 
     function registerSource(name, getFn) {
       _sources[name] = getFn;
     }
 
     function scrapePageText() {
+      const parts = [];
+
+      // 1. Extract table data as "Header: Cell, Cell | Header: Cell, Cell" rows
+      //    so the AI gets structured readings rather than a jumbled text stream.
+      document.querySelectorAll("table").forEach((table) => {
+        const cs = window.getComputedStyle(table);
+        if (cs.display === "none" || cs.visibility === "hidden") return;
+
+        const headers = [...table.querySelectorAll("th")].map(th => th.innerText.trim()).filter(Boolean);
+        const rows = [...table.querySelectorAll("tbody tr")];
+        if (!rows.length) return;
+
+        parts.push("[Table]");
+        if (headers.length) parts.push(headers.join(" | "));
+        rows.slice(0, 50).forEach(tr => {
+          const cells = [...tr.querySelectorAll("td")].map(td => td.innerText.trim());
+          if (cells.some(Boolean)) parts.push(cells.join(" | "));
+        });
+        parts.push("");
+      });
+
+      // 2. Remaining visible text (headings, labels, values outside tables).
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
         acceptNode(node) {
           const el  = node.parentElement;
           if (!el) return NodeFilter.FILTER_REJECT;
           const tag = el.tagName.toLowerCase();
-          if (["script","style","noscript","meta","head"].includes(tag)) return NodeFilter.FILTER_REJECT;
+          if (["script","style","noscript","meta","head","table","th","td"].includes(tag))
+            return NodeFilter.FILTER_REJECT;
           const cs = window.getComputedStyle(el);
           if (cs.display === "none" || cs.visibility === "hidden") return NodeFilter.FILTER_SKIP;
           return node.textContent.trim() ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP;
@@ -1526,18 +1654,39 @@
       const texts = [];
       let node;
       while ((node = walker.nextNode())) texts.push(node.textContent.trim());
-      return texts.join(" ").replace(/\s+/g, " ").trim();
+      if (texts.length) parts.push(texts.join(" ").replace(/\s+/g, " ").trim());
+
+      return parts.join("\n");
     }
 
     async function collectExtra() {
-      const extra = {};
+      // Start from the live pushed snapshot, then overlay with fresh source-fn calls.
+      // Source fns always win so stale pushed values don't shadow live data.
+      const extra = { ..._pushed };
       for (const [name, getFn] of Object.entries(_sources)) {
-        try { extra[name] = await Promise.resolve(getFn()); } catch { /* ignore */ }
+        try {
+          const val = await Promise.resolve(getFn());
+          if (val !== null && val !== undefined) extra[name] = val;
+        } catch { /* ignore */ }
       }
       return Object.keys(extra).length ? extra : null;
     }
 
-    return { registerSource, scrapePageText, collectExtra };
+    // Returns the union of registered source names and pushed keys.
+    function listSources() {
+      return [...new Set([...Object.keys(_sources), ...Object.keys(_pushed)])];
+    }
+
+    // Fetches a single named source: source fn takes priority over pushed cache.
+    // Returns null if the name is unknown on both sides.
+    async function getSource(name) {
+      if (name in _sources) {
+        try { return await Promise.resolve(_sources[name]()); } catch { /* fall through */ }
+      }
+      return Object.prototype.hasOwnProperty.call(_pushed, name) ? _pushed[name] : null;
+    }
+
+    return { registerSource, scrapePageText, collectExtra, listSources, getSource };
   })();
 
   // ════════════════════════════════════════════════════════════════════════════
@@ -1609,6 +1758,33 @@
           conversationToken: token,
           dynamicVariables:  dynamic_variables,
 
+          // Generic client tools — work with any dashboard that uses registerSource().
+          // The AI calls these to pull live data on demand during the conversation.
+          clientTools: {
+            // Lets the AI discover what data the host page has registered.
+            list_data_sources: async () => {
+              return { sources: PageScraper.listSources() };
+            },
+
+            // Lets the AI fetch any named source by name, with a size cap so the
+            // context window doesn't get overwhelmed by large datasets.
+            get_data_source: async ({ name }) => {
+              const data = await PageScraper.getSource(name);
+              if (data === null || data === undefined) {
+                return { available: false, name };
+              }
+              const json = JSON.stringify(data, null, 2);
+              return {
+                available: true,
+                name,
+                // Truncate large payloads; voice AI doesn't need raw table dumps.
+                data: json.length > 5000
+                  ? json.slice(0, 5000) + "\n...[truncated — ask for a specific field]"
+                  : data,
+              };
+            },
+          },
+
           onConnect:    () => { callbacks.onTypingStop(); callbacks.onConnect(); },
           onDisconnect: () => { _session = null; callbacks.onDisconnect(); },
           onMessage:    ({ message, source }) => {
@@ -1657,6 +1833,67 @@
   })();
 
   // ════════════════════════════════════════════════════════════════════════════
+  // MODULE: TextChat — stateless text-based chat via backend /api/chat.
+  // Generic: works with any dashboard — context comes from PageScraper, not
+  // from any dashboard-specific code. History is kept per session for multi-turn.
+  // ════════════════════════════════════════════════════════════════════════════
+  const TextChat = (() => {
+    // Rolling conversation history — [{role, content}].
+    // Capped at 20 entries (10 turns) to keep context window sane.
+    let _history = [];
+
+    async function send(message, callbacks, model) {
+      callbacks.onTypingStart();
+
+      const content = PageScraper.scrapePageText();
+      const extra   = await PageScraper.collectExtra();
+
+      try {
+        const body = {
+          message,
+          history: _history.slice(-20),
+          url:     window.location.href,
+          title:   document.title,
+          content: content.slice(0, 4000),
+          extra,
+        };
+        if (model) body.model = model;
+
+        const res = await fetch(`${Config.BACKEND}/api/chat`, {
+          method:  "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || `Chat failed (${res.status})`);
+        }
+
+        const data  = await res.json();
+        const reply = data.reply || "";
+
+        // Maintain rolling history for multi-turn context.
+        _history.push({ role: "user",      content: message });
+        _history.push({ role: "assistant", content: reply   });
+        if (_history.length > 20) _history = _history.slice(-20);
+
+        callbacks.onTypingStop();
+        callbacks.onMessage("assistant", reply);
+
+      } catch (err) {
+        callbacks.onTypingStop();
+        callbacks.onError(err.message || String(err));
+      }
+    }
+
+    // Called when switching away from text mode — clears turn history.
+    function reset() { _history = []; }
+
+    return { send, reset };
+  })();
+
+  // ════════════════════════════════════════════════════════════════════════════
   // MODULE: App — orchestrates all modules, manages DOM refs, exposes public API
   // ════════════════════════════════════════════════════════════════════════════
   const App = (() => {
@@ -1686,6 +1923,11 @@
       }
       if (cfg && !cfg.ready) {
         _addMessage("system", "Backend not ready — check server setup.");
+      }
+
+      // Populate model picker if text chat is enabled and models are returned.
+      if (cfg && cfg.chat_enabled && cfg.chat_models && cfg.chat_models.length > 0) {
+        _populateModelSelector(cfg.chat_models, cfg.chat_default_model);
       }
 
       _populateAvatarSelector(avatars);
@@ -1727,21 +1969,67 @@
       });
     }
 
+    // ── Model selector (text chat) ────────────────────────────────────────────
+    let _chatModels = [];
+
+    function _populateModelSelector(models, defaultModel) {
+      _chatModels = models;
+      if (!_refs.modelSelect || models.length === 0) return;
+
+      _refs.modelSelect.innerHTML = "";
+      models.forEach(id => {
+        const opt       = document.createElement("option");
+        opt.value       = id;
+        opt.textContent = _formatModelLabel(id);
+        _refs.modelSelect.appendChild(opt);
+      });
+
+      // Honour data-chat-model override → backend default → first in list.
+      const preferred = Config.DEFAULT_CHAT_MODEL || defaultModel || models[0];
+      if (preferred && models.includes(preferred)) {
+        _refs.modelSelect.value = preferred;
+      }
+    }
+
+    // Turns "nvidia/nemotron-3-ultra-550b-a55b:free" → "Nemotron Ultra 550B"
+    function _formatModelLabel(id) {
+      const base = id.replace(/:free$/, "").split("/").pop() || id;
+      return base
+        .replace(/-/g, " ")
+        .replace(/\b\w/g, c => c.toUpperCase())
+        .replace(/\b(\d+[bBmM])\b/gi, s => s.toUpperCase());
+    }
+
     // ── Event wiring ──────────────────────────────────────────────────────────
     function _wireEvents() {
       // Tab toggles the panel open/closed
       _refs.tab.addEventListener("click", () => _setOpen(!State.get("isOpen")));
 
-      // Avatar zone click → start conversation
-      _refs.zone.addEventListener("click", _handleMicClick);
+      // Avatar zone click → start voice conversation (only in voice mode)
+      _refs.zone.addEventListener("click", () => {
+        if (State.get("inputMode") === "voice") _handleMicClick();
+      });
 
       // Mic/call button
       _refs.callBtn.addEventListener("click", (e) => { e.stopPropagation(); _handleMicClick(); });
 
+      // Mode toggle (voice ↔ text) — only rendered when CHAT_ENABLED
+      if (_refs.modeBtn) {
+        _refs.modeBtn.addEventListener("click", (e) => {
+          e.stopPropagation();
+          _setInputMode(State.get("inputMode") === "voice" ? "text" : "voice");
+        });
+      }
+
+      // Send button (text mode)
+      if (_refs.sendBtn) {
+        _refs.sendBtn.addEventListener("click", (e) => { e.stopPropagation(); _handleSend(); });
+      }
+
       // Mute
       _refs.muteBtn.addEventListener("click", (e) => { e.stopPropagation(); _toggleMute(); });
 
-      // Text input enter key
+      // Text input: Enter sends in text mode, otherwise passthrough
       _refs.input.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); _handleSend(); }
       });
@@ -1750,6 +2038,7 @@
       // State → DOM reactivity
       State.on("mode",      _applyMode);
       State.on("isOpen",    _applyOpen);
+      State.on("inputMode", _applyInputMode);
       State.on("agentName", (n) => { if (_refs.agentName) _refs.agentName.textContent = n; });
     }
 
@@ -1763,6 +2052,56 @@
 
     function _applyOpen(isOpen) {
       _refs.wrapper.classList.toggle("collapsed", !isOpen);
+    }
+
+    // ── Input mode (voice / text) ─────────────────────────────────────────────
+    function _setInputMode(mode) {
+      // If switching away from voice while a call is active, end it first.
+      if (mode === "text" && Conversation.isActive()) {
+        Conversation.end().then(() => {
+          State.set("mode", "idle");
+          State.set("inputMode", "text");
+        });
+        return;
+      }
+      if (mode === "voice") TextChat.reset();
+      State.set("inputMode", mode);
+    }
+
+    function _applyInputMode(mode) {
+      const isText = mode === "text";
+
+      // Toggle which action button is visible
+      if (_refs.callBtn)  _refs.callBtn.style.display  = isText ? "none" : "";
+      if (_refs.muteBtn)  _refs.muteBtn.style.display  = isText ? "none" : "";
+      if (_refs.sendBtn)  _refs.sendBtn.classList.toggle("visible", isText);
+
+      // Show model picker only in text mode when models are available
+      if (_refs.modelRow) {
+        _refs.modelRow.classList.toggle("hidden", !isText || _chatModels.length < 1);
+      }
+
+      // Update mode-toggle button icon and active state
+      if (_refs.modeBtn) {
+        _refs.modeBtn.classList.toggle("text-active", isText);
+      }
+      if (_refs.modeIconText)  _refs.modeIconText.style.display  = isText ? "none" : "";
+      if (_refs.modeIconVoice) _refs.modeIconVoice.style.display = isText ? ""     : "none";
+
+      // Placeholder reflects current mode
+      if (_refs.input) {
+        _refs.input.placeholder = isText ? "Type your message…" : "Ask anything…";
+      }
+
+      // Status label when idle reflects mode
+      if (State.get("mode") === "idle") {
+        const label = isText ? Config.STATUS_LABELS["text-idle"] : Config.STATUS_LABELS["idle"];
+        if (_refs.status) {
+          _refs.status.textContent = label;
+          _refs.status.className   = "av-status-label";
+        }
+        if (_refs.hint) _refs.hint.style.display = isText ? "none" : "";
+      }
     }
 
     // ── Avatar initialisation ─────────────────────────────────────────────────
@@ -1835,6 +2174,7 @@
     function _syncStateToDOM() {
       _applyMode(State.get("mode"));
       _applyOpen(State.get("isOpen"));
+      _applyInputMode(State.get("inputMode"));
     }
 
     // ── Conversation callbacks ────────────────────────────────────────────────
@@ -1870,20 +2210,38 @@
       if (!text) return;
       _refs.input.value = "";
 
-      if (!Conversation.isActive()) {
-        if (!State.get("isOpen")) _setOpen(true);
-        _addMessage("user", text);
-        _addMessage("system", "Starting voice session…");
-        await _handleMicClick();
-        return;
-      }
+      if (!State.get("isOpen")) _setOpen(true);
 
-      try {
-        // ElevenLabs Conversation API does not expose sendUserMessage in the same
-        // way across all versions — fall back gracefully.
-        const session = Conversation;
+      if (State.get("inputMode") === "text") {
         _addMessage("user", text);
-      } catch { /* non-fatal */ }
+        State.set("mode", "thinking");
+        const selectedModel = (_refs.modelSelect && _refs.modelSelect.value) || null;
+        await TextChat.send(text, {
+          onTypingStart: () => _showTyping(),
+          onTypingStop:  () => _hideTyping(),
+          onMessage: (_role, reply) => {
+            _addMessage("assistant", reply);
+            State.set("mode", "idle");
+            // Keep status label contextual for text mode
+            if (_refs.status) {
+              _refs.status.textContent = Config.STATUS_LABELS["text-idle"];
+              _refs.status.className   = "av-status-label";
+            }
+            if (_refs.hint) _refs.hint.style.display = "none";
+          },
+          onError: (msg) => {
+            State.set("mode", "idle");
+            _addMessage("system", `Error: ${msg}`);
+          },
+        }, selectedModel);
+      } else {
+        // Voice mode — text input starts the voice session if not already active
+        _addMessage("user", text);
+        if (!Conversation.isActive()) {
+          _addMessage("system", "Starting voice session…");
+          _handleMicClick();
+        }
+      }
     }
 
     function _toggleMute() {
@@ -1920,9 +2278,10 @@
     // ── Public API ─────────────────────────────────────────────────────────────
     return {
       init,
-      open:   () => _setOpen(true),
-      close:  () => _setOpen(false),
-      toggle: () => _setOpen(!State.get("isOpen")),
+      open:    () => _setOpen(true),
+      close:   () => _setOpen(false),
+      toggle:  () => _setOpen(!State.get("isOpen")),
+      setMode: (mode) => _setInputMode(mode),  // "voice" | "text"
     };
   })();
 
@@ -1939,10 +2298,17 @@
   // Public window API
   // ════════════════════════════════════════════════════════════════════════════
   window.AiAvatar = {
-    registerSource: (name, getFn, opts) => PageScraper.registerSource(name, getFn),
-    open:   () => App.open(),
-    close:  () => App.close(),
-    toggle: () => App.toggle(),
+    registerSource: (name, getFn)   => PageScraper.registerSource(name, getFn),
+    pushContext:    (key, value)    => window.dispatchEvent(
+      new CustomEvent("ai-avatar:context-push", { detail: { [key]: value } })
+    ),
+    open:    () => App.open(),
+    close:   () => App.close(),
+    toggle:  () => App.toggle(),
+    // Switch input mode programmatically — useful for dashboards that want to
+    // control whether users see voice or text by default.
+    // "voice" | "text"
+    setMode: (mode) => App.setMode(mode),
   };
 
   // ════════════════════════════════════════════════════════════════════════════

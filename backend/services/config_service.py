@@ -7,7 +7,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-_CONFIG_FILE = Path(__file__).parent.parent / "config.json"
+_CONFIG_FILE = Path(__file__).parent.parent.parent / "config.json"
 
 _DEFAULTS: dict[str, Any] = {
     "agent_id": "",

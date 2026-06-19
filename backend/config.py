@@ -1,11 +1,12 @@
-import os
 import json
+import os
 from pathlib import Path
+
 from dotenv import load_dotenv
 
 load_dotenv()
 
-CONFIG_FILE = Path(__file__).parent / "config.json"
+CONFIG_FILE = Path(__file__).parent.parent / "config.json"
 
 DEFAULT_CONFIG = {
     "agent_id": "",

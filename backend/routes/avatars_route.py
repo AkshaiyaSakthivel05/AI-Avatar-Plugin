@@ -13,7 +13,7 @@ _SUPPORTED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 # Human-readable labels keyed by stem — extend this dict to rename any avatar.
 _LABELS: dict[str, str] = {
     "avatar-woman": "Sarah",
-    "avatar-man":   "James",
+    "avatar-man": "James",
 }
 
 
@@ -24,12 +24,14 @@ async def list_avatars() -> AvatarsResponse:
     if _AVATARS_DIR.exists():
         for path in sorted(_AVATARS_DIR.iterdir()):
             if path.suffix.lower() in _SUPPORTED_EXTENSIONS:
-                stem  = path.stem
+                stem = path.stem
                 label = _LABELS.get(stem, stem.replace("-", " ").title())
-                items.append(AvatarItem(
-                    id    = stem,
-                    label = label,
-                    url   = f"/avatars/{path.name}",
-                ))
+                items.append(
+                    AvatarItem(
+                        id=stem,
+                        label=label,
+                        url=f"/avatars/{path.name}",
+                    )
+                )
 
     return AvatarsResponse(avatars=items)
